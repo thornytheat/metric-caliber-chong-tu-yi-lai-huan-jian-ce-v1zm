@@ -65,15 +65,16 @@
       <div class="table-wrap">
         <table class="dense">
           <thead>
-            <tr><th>体检号</th><th>结论</th><th class="nowrap">冲突 / 环 / 阻断</th><th>无法解析</th><th class="nowrap">生成时间</th><th></th></tr>
+            <tr><th>体检号</th><th>状态</th><th>结论</th><th class="nowrap">冲突 / 环 / 阻断</th><th class="nowrap">新增 / 持续 / 消失</th><th class="nowrap">生成时间</th><th></th></tr>
           </thead>
           <tbody>
           {% for item in recent_checks %}
             <tr>
               <td class="nowrap"><a class="mono" href="/result/{{ item.check_id }}">{{ item.check_id }}</a></td>
+              <td class="nowrap">{% if item.status == 'confirmed' %}<span class="tag ok">基线</span>{% else %}<span class="tag warn">候选</span>{% endif %}</td>
               <td class="nowrap">{% if item.verdict == 'blocked' %}<span class="tag err">不可发布</span>{% else %}<span class="tag ok">通过</span>{% endif %}</td>
               <td class="nowrap"><span class="num">{{ item.stats.conflict_count }}</span> <span class="muted small">/</span> <span class="num">{{ item.stats.cycle_count }}</span> <span class="muted small">/</span> <span class="num">{{ item.stats.publish_blocked_count }}</span></td>
-              <td class="num">{{ item.stats.unresolved_count }}</td>
+              <td class="nowrap"><span class="num">{{ item.comparison.new_count }}</span> <span class="muted small">/</span> <span class="num">{{ item.comparison.persistent_count }}</span> <span class="muted small">/</span> <span class="num">{{ item.comparison.resolved_count }}</span></td>
               <td class="small muted nowrap">{{ item.created_at[:16] }}</td>
               <td class="nowrap"><a class="btn secondary small" href="/result/{{ item.check_id }}">依据</a></td>
             </tr>
@@ -85,6 +86,18 @@
       <div class="empty">
         <strong>还没有体检记录</strong>
         点右上角「执行注册表体检」，或用右侧快捷操作跑一次，结果会落到 SQLite 并出现在这里。
+      </div>
+      {% endif %}
+      {% if baseline %}
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0">当前已确认基线：
+          <a class="mono" href="/result/{{ baseline.check_id }}">{{ baseline.check_id }}</a>
+          · {{ baseline.created_at }} · 指纹 <code>{{ baseline.fingerprint }}</code>。
+          候选结论需在结果页手动确认后才会切换基线。</p>
+      </div>
+      {% else %}
+      <div class="panel-body tight">
+        <p class="small muted" style="margin:0">还没有已确认基线：下一次体检会把全部问题列为新增（待确认基线），确认后开始只报增量。</p>
       </div>
       {% endif %}
     </section>
@@ -136,9 +149,9 @@
           <a class="btn secondary small" href="/review">复核影响面与发布</a>
         </div>
         <ol class="list small" style="margin:12px 0 0">
-          <li>体检：落库一份结论快照，逐条带依据，可在「最近体检」里回看。</li>
-          <li>工作台：选指标改表达式/维度，实时看归一化与注册表状态。</li>
-          <li>复核与发布：算 breaking 影响面，过门禁后才允许发布。</li>
+          <li>体检：落库一份候选结论，按新增/持续/消失对比已确认基线，逐条带依据。</li>
+          <li>确认：结果页点「确认为新基线」，候选才会切换基线；未确认前不生效。</li>
+          <li>工作台 / 复核与发布：算 breaking 影响面，过门禁后才允许发布。</li>
         </ol>
       </div>
     </section>

@@ -1,16 +1,16 @@
 {% extends "base.html" %}
 {% block title %}体检结果 · {% if check %}{{ check.check_id }}{% else %}{{ check_id }}{% endif %}{% endblock %}
 {% block crumb %}体检结果{% endblock %}
-{% block meta %}{% if check %}<span class="dot {% if check.verdict == 'blocked' %}err{% else %}ok{% endif %}"></span>{% if check.verdict == 'blocked' %}不可发布{% else %}通过{% endif %} · {{ check.created_at }}{% else %}<span class="dot err"></span>记录不存在{% endif %}{% endblock %}
+{% block meta %}{% if check and check.status == 'failed' %}<span class="dot err"></span>体检失败 · {{ check.created_at }}{% elif check and check.status == 'running' %}<span class="dot warn"></span>体检进行中{% elif check %}<span class="dot {% if check.verdict == 'blocked' %}err{% else %}ok{% endif %}"></span>{% if check.status == 'confirmed' %}基准结论{% else %}候选结论 · 待确认{% endif %} · {{ check.created_at }}{% else %}<span class="dot err"></span>记录不存在{% endif %}{% endblock %}
 {% block actions %}
 <a class="btn secondary small" href="/workbench">回工作台</a>
-{% if check %}<a class="btn secondary small" href="/api/check/{{ check.check_id }}">查看 JSON</a>{% endif %}
+{% if check and check.status in ('candidate', 'confirmed') %}<a class="btn secondary small" href="/api/check/{{ check.check_id }}">查看 JSON</a>{% endif %}
 <form method="post" action="/check" style="display:inline-flex;margin:0">
-  <button type="submit" class="btn small">重新体检</button>
+  <button type="submit" class="btn small">新体检</button>
 </form>
 {% endblock %}
-{% block status_left %}{% if check %}体检指纹 <code>{{ check.fingerprint }}</code> · 注册表快照 {{ check.metrics | length }} 条 · 生成于 {{ check.created_at }}{% else %}未找到该体检记录{% endif %}{% endblock %}
-{% block status_right %}{% if check %}check_id <code>{{ check.check_id }}</code>{% else %}{{ app_name }}{% endif %}{% endblock %}
+{% block status_left %}{% if check %}体检指纹 <code>{{ check.fingerprint or '—' }}</code> · 注册表快照 {{ check.metrics | length if check.metrics else 0 }} 条 · 生成于 {{ check.created_at }}{% else %}未找到该体检记录{% endif %}{% endblock %}
+{% block status_right %}{% if check %}check_id <code>{{ check.check_id }}</code> · {{ check.status }}{% else %}{{ app_name }}{% endif %}{% endblock %}
 
 {% block content %}
 {% if missing %}
@@ -33,6 +33,70 @@
     </div>
   </section>
 </div>
+{% elif check.status == 'failed' %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">体检失败 · {{ check.check_id }}</h1>
+    <p class="page-sub">{{ check.created_at }} · 失败原因：{{ check.error }}</p>
+  </div>
+  <div class="page-head-actions">
+    {% if baseline %}<a class="btn secondary small" href="/result/{{ baseline.check_id }}">查看已确认基线</a>{% endif %}
+  </div>
+</div>
+<div class="alert alert-error" role="alert">
+  <strong>这次体检没有产出可用结论。</strong>失败记录已保留（不会覆盖或删除旧结论），已确认基线不受影响。
+  可以重试本次记录（复用同一条记录，不会重复写入），或发起一次新体检。
+</div>
+{% if check.attempts %}
+<div class="panel">
+  <div class="panel-head"><h2>本条记录的尝试轨迹</h2>
+    <div class="panel-actions"><span class="tag">{{ check.attempts | length }} 次</span></div>
+  </div>
+  <div class="table-wrap">
+    <table class="dense">
+      <thead><tr><th>时间</th><th>结果</th><th>错误</th></tr></thead>
+      <tbody>
+        {% for attempt in check.attempts %}
+        <tr><td class="small muted nowrap">{{ attempt.at }}</td>
+          <td>{% if attempt.status == 'failed' %}<span class="tag err">失败</span>{% else %}<span class="tag ok">{{ attempt.status }}</span>{% endif %}</td>
+          <td class="small">{{ attempt.error }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+<div class="split wide-left">
+  <section class="panel">
+    <div class="panel-head"><h2>重试与恢复</h2></div>
+    <div class="panel-body">
+      <p class="small muted" style="margin:0 0 8px">
+        {% if baseline %}
+        可继续使用的上一份已确认基线：<a class="mono" href="/result/{{ baseline.check_id }}">{{ baseline.check_id }}</a>
+        （{{ baseline.created_at }} · {% if baseline.verdict == 'blocked' %}不可发布{% else %}通过{% endif %}）。
+        {% else %}
+        还没有已确认基线；旧候选结论仍可在复核页查看。
+        {% endif %}
+      </p>
+      <p class="small muted" style="margin:0">重试会以同一 attempt_key 复用这条失败记录，成功后它变为候选结论；重复点击重试不会产生多条记录。</p>
+    </div>
+    <div class="panel-actions">
+      <form method="post" action="/check" style="margin:0">
+        <input type="hidden" name="attempt_key" value="{{ check.attempt_key }}">
+        <button type="submit" class="small">重试（复用本次记录）</button>
+      </form>
+      <form method="post" action="/check" style="margin:0"><button type="submit" class="secondary small">发起新体检</button></form>
+    </div>
+  </section>
+</div>
+{% elif check.status == 'running' %}
+<div class="page-head">
+  <div>
+    <h1 class="page-title">体检进行中 · {{ check.check_id }}</h1>
+    <p class="page-sub">{{ check.created_at }} · 该记录尚未产出结论，不能确认为基线。</p>
+  </div>
+</div>
+<div class="alert alert-info" role="status">若进程中断，这条记录会在重启后被标记为失败，旧结论不受影响。</div>
 {% else %}
 
 <div class="page-head">
@@ -40,10 +104,17 @@
     <h1 class="page-title">注册表体检结果 · {{ check.check_id }}</h1>
     <p class="page-sub">
       {{ check.created_at }} · 体检指纹 <code>{{ check.fingerprint }}</code> · 注册表快照 {{ check.metrics | length }} 个指标版本 ·
-      结论 <strong>{% if check.verdict == 'blocked' %}不可发布{% else %}通过{% endif %}</strong>
+      结论 <strong>{% if check.verdict == 'blocked' %}不可发布{% else %}通过{% endif %}</strong> ·
+      {% if check.status == 'confirmed' %}<span class="tag ok">已确认为基线</span>{% else %}<span class="tag warn">候选结论，待确认</span>{% endif %}
     </p>
   </div>
   <div class="page-head-actions">
+    {% if check.status == 'candidate' %}
+    <form method="post" action="/check/{{ check.check_id }}/confirm" style="margin:0"
+          onsubmit="return confirm('确认用这份候选结论替换当前基线？确认后后续体检将以它为对比基准。');">
+      <button type="submit" class="btn small">确认为新基线</button>
+    </form>
+    {% endif %}
     <a class="btn secondary small" href="/review">复核与发布</a>
     <a class="btn small" href="/workbench">去工作台改口径</a>
   </div>
@@ -51,7 +122,30 @@
 
 <div class="alert {% if check.verdict == 'blocked' %}alert-error{% else %}alert-info{% endif %}" role="status">
   <strong>结论：{% if check.verdict == 'blocked' %}不可发布。{% else %}通过。{% endif %}</strong>{{ check.verdict_detail }}
+  {% if check.baseline.check_id %}
+  <div class="small" style="margin-top:4px">本次对比基线：<a class="mono" href="/result/{{ check.baseline.check_id }}">{{ check.baseline.check_id }}</a>（{{ check.baseline.created_at }}）</div>
+  {% elif check.status != 'confirmed' %}
+  <div class="small" style="margin-top:4px">这是第一份可对比的体检，尚无可对比的已确认基线。</div>
+  {% endif %}
 </div>
+
+{% if check.status == 'candidate' and not is_baseline %}
+<div class="alert alert-info" role="status">
+  这是一份<strong>候选结论</strong>：用于和当前基线对比，但确认之前不会切换为新基线。
+  后续体检仍以已确认基线为参照。
+</div>
+{% endif %}
+
+{% if check.attempts %}
+<details class="help" style="margin:0 0 10px">
+  <summary>本条记录重试前有 {{ check.attempts | length }} 次失败（记录已保留，结论以最新成功为准）</summary>
+  <ul class="list small" style="margin:4px 0 0">
+    {% for attempt in check.attempts %}
+    <li><span class="tag err">失败</span> {{ attempt.at }} · {{ attempt.error }}</li>
+    {% endfor %}
+  </ul>
+</details>
+{% endif %}
 
 <div class="kpi-strip">
   <div class="kpi {% if check.stats.conflict_count %}err{% else %}ok{% endif %}">
@@ -80,6 +174,10 @@
     <div class="k-note">最长下游深度 {{ check.stats.max_depth }}（{{ check.stats.max_depth_node }}）</div>
   </div>
 </div>
+
+{% with comparison = check.comparison %}
+{% include "_comparison.html" %}
+{% endwith %}
 
 <div class="panel">
   <div class="panel-head">

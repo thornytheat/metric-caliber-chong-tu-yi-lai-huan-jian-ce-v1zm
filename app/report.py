@@ -3,13 +3,25 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 from datetime import datetime, timezone
 
-from . import conflict, expr, gate, graph as graph_mod, registry
+from . import conflict, expr, gate, graph as graph_mod, history, registry
 
 VERDICT_BLOCKED = "blocked"
 VERDICT_PASSED = "passed"
+
+# 指纹只取「影响结论的注册表事实」，避免把生成时间等噪声纳入，
+# 这样同一份注册表重复体检得到的指纹一致，可用于幂等与基线一致性判断。
+FINGERPRINT_FIELDS = (
+    "name",
+    "version",
+    "expression",
+    "aggregation",
+    "dimensions",
+    "published",
+)
 
 
 def now_iso() -> str:
@@ -20,13 +32,27 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(5)}"
 
 
-def fingerprint(payload: dict) -> str:
-    return hashlib.sha256(
-        repr(sorted(payload.items())).encode("utf-8")
-    ).hexdigest()[:12]
+def fingerprint(metrics: list[dict]) -> str:
+    """注册表快照指纹：只看决定体检结论的字段。"""
+    rows = []
+    for metric in sorted(metrics, key=lambda item: (item["name"], int(item["version"]))):
+        rows.append(
+            [
+                str(metric.get(field, "")) if field != "dimensions"
+                else sorted(str(dim) for dim in (metric.get(field) or []))
+                for field in FINGERPRINT_FIELDS
+            ]
+        )
+    canonical = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
 
 
-def build_check(metrics: list[dict], check_id: str | None = None) -> dict:
+def build_check(
+    metrics: list[dict],
+    check_id: str | None = None,
+    baseline: dict | None = None,
+    created_at: str | None = None,
+) -> dict:
     graph = graph_mod.build_graph(metrics)
     cycles = graph_mod.find_cycles(graph)
     conflicts = conflict.detect_conflicts(metrics)
@@ -69,7 +95,7 @@ def build_check(metrics: list[dict], check_id: str | None = None) -> dict:
 
     payload = {
         "check_id": check_id or new_id("chk"),
-        "created_at": now_iso(),
+        "created_at": created_at or now_iso(),
         "verdict": verdict,
         "verdict_detail": (
             "；".join(reasons) + "，注册表不可直接发布"
@@ -102,7 +128,19 @@ def build_check(metrics: list[dict], check_id: str | None = None) -> dict:
             for metric in sorted(metrics, key=lambda item: (item["name"], item["version"]))
         ],
     }
-    payload["fingerprint"] = fingerprint({"check_id": payload["check_id"]})
+    payload["fingerprint"] = fingerprint(metrics)
+    payload["baseline"] = {
+        "check_id": baseline.get("check_id") if baseline else None,
+        "created_at": baseline.get("created_at") if baseline else None,
+        "fingerprint": baseline.get("fingerprint") if baseline else None,
+    }
+    comparison = history.compare(payload, baseline)
+    payload["comparison"] = comparison
+    payload["delta_stats"] = {
+        "new_count": comparison["new_count"],
+        "persistent_count": comparison["persistent_count"],
+        "resolved_count": comparison["resolved_count"],
+    }
     return payload
 
 

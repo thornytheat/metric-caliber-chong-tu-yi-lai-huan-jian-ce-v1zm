@@ -1,0 +1,205 @@
+{# 历史对比片段：新增 / 持续 / 消失。需要上下文变量 comparison（check.comparison）。 #}
+{% set cmp = comparison %}
+<section class="panel" id="history-compare">
+  <div class="panel-head">
+    <h2>相对已确认基线的变化</h2>
+    <div class="panel-actions">
+      {% if cmp.has_baseline %}
+      <span class="tag">基线 <a class="mono" href="/result/{{ cmp.baseline_check_id }}">{{ cmp.baseline_check_id }}</a> · {{ cmp.baseline_created_at }}</span>
+      {% else %}
+      <span class="tag warn">暂无已确认基线</span>
+      {% endif %}
+      <span class="tag err">新增 {{ cmp.new_count }}</span>
+      <span class="tag warn">持续 {{ cmp.persistent_count }}</span>
+      <span class="tag ok">消失 {{ cmp.resolved_count }}</span>
+    </div>
+  </div>
+
+  {% if not cmp.has_baseline %}
+  <div class="panel-body tight">
+    <p class="small muted" style="margin:0">这是第一份可对比的体检：下列问题全部列为「新增（待确认基线）」。确认为基线后，后续体检只报告相对这份结论的增减。</p>
+  </div>
+  {% endif %}
+
+  {% if cmp.metric_changes.counts.added or cmp.metric_changes.counts.changed or cmp.metric_changes.counts.removed %}
+  <div class="panel-body tight">
+    <p class="small" style="margin:0 0 4px"><strong>本次注册表实际变化</strong>
+      <span class="tag ok">新增 {{ cmp.metric_changes.counts.added }} 个版本</span>
+      <span class="tag warn">变更 {{ cmp.metric_changes.counts.changed }} 个</span>
+      <span class="tag">移除 {{ cmp.metric_changes.counts.removed }} 个</span>
+    </p>
+    <ul class="list small" style="margin:0">
+      {% for change in cmp.metric_changes.added %}
+      <li><span class="tag ok">新增版本</span> <code>{{ change.key }}</code>
+        <span class="mono">{{ change.after.normalized }}</span>
+        <span class="muted">（{{ change.after.aggregation }} · {{ change.after.dimensions | join(', ') }} · {{ '已发布' if change.after.published else '未发布' }}）</span></li>
+      {% endfor %}
+      {% for change in cmp.metric_changes.changed %}
+      <li><span class="tag warn">口径变更</span> <code>{{ change.key }}</code>
+        {% for field, diff in change.fields.items() %}
+        <span class="muted small">{{ field }}:</span>
+        <span class="mono small">{{ diff.before }}</span> → <span class="mono small"><strong>{{ diff.after }}</strong></span>{% if not loop.last %}；{% endif %}
+        {% endfor %}</li>
+      {% endfor %}
+      {% for change in cmp.metric_changes.removed %}
+      <li><span class="tag">移除版本</span> <code>{{ change.key }}</code> <span class="mono muted">{{ change.before.normalized }}</span></li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  <div class="segmented" id="compare-tabs" style="margin:8px 12px 0">
+    <button type="button" data-tab-target="cmp-new" class="active">新增 {{ cmp.new_count }}</button>
+    <button type="button" data-tab-target="cmp-persistent">持续 {{ cmp.persistent_count }}</button>
+    <button type="button" data-tab-target="cmp-resolved">消失 {{ cmp.resolved_count }}</button>
+  </div>
+
+  <div class="panel-body flush">
+    <div id="cmp-new" class="tab-panel">
+      {% if cmp.new %}
+      {% for issue in cmp.new %}
+      <div class="toolbar">
+        <strong><span class="tag err">{{ issue.kind_label }}</span> {{ issue.title }}</strong>
+        <span class="spacer"></span>
+        {% if issue.detail.variant_count %}<span class="tag">{{ issue.detail.variant_count }} 组口径</span>{% endif %}
+        <span class="tag">涉及 {{ issue.versions | length }} 个版本</span>
+        <span class="tag warn">下游 {{ issue.downstream_count }}</span>
+      </div>
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>涉及版本</th><th>本次变化</th><th>问题依据</th></tr></thead>
+          <tbody>
+            {% for key in issue.versions %}
+            {% set inv = issue.involved | selectattr('key', 'equalto', key) | list %}
+            <tr>
+              <td class="nowrap"><strong>{{ key }}</strong>
+                {% if inv and inv[0].status == 'added' %}<span class="tag ok">新增版本</span>
+                {% elif inv and inv[0].status == 'changed' %}<span class="tag warn">口径变更</span>
+                {% elif inv and inv[0].status == 'removed' %}<span class="tag">已移除</span>
+                {% elif inv and inv[0].status == 'initial' %}<span class="tag">首次体检</span>
+                {% else %}<span class="tag ok">未变</span>{% endif %}
+              </td>
+              <td class="small">
+                {% set change = issue.changes | selectattr('key', 'equalto', key) | list %}
+                {% if change %}
+                  {% for field, diff in change[0].fields.items() %}
+                  <div><span class="muted">{{ field }}:</span> <span class="mono">{{ diff.before }}</span> → <span class="mono"><strong>{{ diff.after }}</strong></span></div>
+                  {% endfor %}
+                  {% if change[0].status == 'added' %}<div class="mono">{{ change[0].after.normalized }}</div>{% endif %}
+                {% elif inv and inv[0].status == 'initial' %}
+                <span class="muted">首次体检，无历史可比；当前口径见右侧依据</span>
+                {% else %}<span class="muted">该版本本次未变化（问题由上下文共同触发）</span>{% endif %}
+                {% for related in issue.related_changes %}
+                {% if related.key in issue.versions %}
+                {% else %}
+                <div class="muted">上游 {{ related.key }} 变化：
+                  {% for field, diff in related.fields.items() %}{{ field }} {{ diff.before }} → {{ diff.after }}{% if not loop.last %}；{% endif %}{% endfor %}
+                </div>
+                {% endif %}
+                {% endfor %}
+              </td>
+              <td class="small">
+                {% if issue.kind == 'conflict' %}
+                  {% for group in issue.detail.groups %}
+                  <div class="mono small">口径{{ loop.index }}：{{ group.normalized }}（{{ group.version_keys | join(' / ') }}）</div>
+                  {% endfor %}
+                {% elif issue.kind == 'cycle' %}
+                  <span class="mono small">{{ issue.detail.path | join(' → ') }}</span>
+                {% else %}
+                  {{ issue.detail.detail }}
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if issue.downstream %}
+      <div class="panel-body tight">
+        <p class="small" style="margin:0 0 4px"><strong>受影响下游 {{ issue.downstream_count }} 个</strong>
+          <span class="muted">（当前依赖图上这些版本的传递下游，按最短跳数排序；先处理靠前的直接下游）</span></p>
+        <p class="small" style="margin:0">
+          {% for item in issue.downstream %}
+          <span class="tag {% if item.depth == 1 %}err{% else %}{% endif %}">{{ item.key }} · L{{ item.depth }}{% if item.owner %} · {{ item.owner }}{% endif %}</span>
+          {% endfor %}
+          {% if issue.downstream_count > issue.downstream | length %}<span class="tag">…共 {{ issue.downstream_count }} 个</span>{% endif %}
+        </p>
+      </div>
+      {% else %}
+      <div class="panel-body tight"><p class="small muted" style="margin:0">当前依赖图上没有传递下游（变化只影响该指标自身）。</p></div>
+      {% endif %}
+      {% endfor %}
+      {% else %}
+      <div class="empty">相对基线没有新增问题。</div>
+      {% endif %}
+    </div>
+
+    <div id="cmp-persistent" class="tab-panel" hidden>
+      {% if cmp.persistent %}
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>类型</th><th>问题</th><th>涉及版本</th><th>相对基线</th><th>本次变化</th><th>下游</th></tr></thead>
+          <tbody>
+            {% for issue in cmp.persistent %}
+            <tr>
+              <td class="nowrap"><span class="tag warn">{{ issue.kind_label }}</span></td>
+              <td class="small"><strong>{{ issue.title }}</strong>
+                {% if issue.kind == 'conflict' %}<div class="muted">{{ issue.detail.variant_count }} 组口径</div>{% endif %}
+              </td>
+              <td class="small mono">{{ issue.versions | join('、') }}</td>
+              <td class="small">
+                {% if issue.delta.added_versions %}<span class="tag ok">新增版本 {{ issue.delta.added_versions | join('、') }}</span>{% endif %}
+                {% if issue.delta.removed_versions %}<span class="tag">移除版本 {{ issue.delta.removed_versions | join('、') }}</span>{% endif %}
+                {% if issue.delta.variant_count_before is defined and issue.delta.variant_count_before != issue.delta.variant_count_after %}
+                <span class="tag warn">口径组 {{ issue.delta.variant_count_before }} → {{ issue.delta.variant_count_after }}</span>
+                {% endif %}
+                {% if not issue.delta.added_versions and not issue.delta.removed_versions and issue.delta.variant_count_before == issue.delta.variant_count_after %}<span class="muted">涉及版本无变化</span>{% endif %}
+              </td>
+              <td class="small">
+                {% if issue.changes %}
+                  {% for change in issue.changes %}
+                  <div><code>{{ change.key }}</code>
+                    {% if change.status == 'added' %}<span class="tag ok">新增</span>
+                      <span class="mono">{{ change.after.normalized }}</span>
+                    {% else %}<span class="tag warn">变更</span>
+                      {% for field, diff in change.fields.items() %}
+                      <span class="muted">{{ field }}:</span> <span class="mono">{{ diff.before }}</span> → <span class="mono">{{ diff.after }}</span>{% if not loop.last %}；{% endif %}
+                      {% endfor %}
+                    {% endif %}
+                  </div>
+                  {% endfor %}
+                {% else %}<span class="muted">—</span>{% endif %}
+              </td>
+              <td class="num">{{ issue.downstream_count }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="empty">没有持续存在的问题。</div>
+      {% endif %}
+    </div>
+
+    <div id="cmp-resolved" class="tab-panel" hidden>
+      {% if cmp.resolved %}
+      <div class="table-wrap">
+        <table class="dense">
+          <thead><tr><th>类型</th><th>问题（基线时存在，本次已消失）</th><th>原涉及版本</th></tr></thead>
+          <tbody>
+            {% for issue in cmp.resolved %}
+            <tr>
+              <td class="nowrap"><span class="tag ok">{{ issue.kind_label }}</span></td>
+              <td class="small"><strong>{{ issue.title }}</strong></td>
+              <td class="small mono">{{ issue.versions | join('、') }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <div class="empty">没有消失的问题。</div>
+      {% endif %}
+    </div>
+  </div>
+</section>

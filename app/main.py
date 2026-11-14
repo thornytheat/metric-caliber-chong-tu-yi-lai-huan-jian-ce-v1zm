@@ -4,15 +4,26 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+import sqlite3
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import conflict, expr, gate, graph as graph_mod, registry, report, seed, settings, store
+from . import (
+    conflict,
+    expr,
+    gate,
+    graph as graph_mod,
+    registry,
+    report,
+    seed,
+    settings,
+    store,
+)
 
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
@@ -21,6 +32,8 @@ templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
 async def lifespan(application: FastAPI):
     with store.session() as conn:
         application.state.seed_result = seed.seed(conn)
+        # 上次进程异常退出时可能留下 running 记录：标记失败，旧结论仍可读
+        store.reclaim_stale_running(conn, stale_running_before(), report.now_iso())
     yield
 
 
@@ -33,6 +46,15 @@ def load_metrics() -> list[dict]:
         store.init_schema(conn)
         metrics = store.all_metrics(conn)
     return [registry.with_normalized(metric) for metric in metrics]
+
+
+def stale_running_before() -> str:
+    """超过 10 分钟仍 running 的记录视为进程已中断。"""
+    from datetime import datetime, timedelta, timezone
+
+    return (
+        datetime.now(timezone.utc).astimezone() - timedelta(minutes=10)
+    ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def base_context(request: Request, **extra: Any) -> dict:
@@ -84,6 +106,12 @@ class RegistryRequest(BaseModel):
     allow_missing_reference: bool = False
 
 
+class CheckRequest(BaseModel):
+    """attempt_key 用于重试幂等：同一次点击重试复用同一条记录。"""
+
+    attempt_key: str | None = Field(default=None, max_length=80)
+
+
 # --------------------------------------------------------------------------- 页面
 
 
@@ -102,6 +130,8 @@ def index(request: Request) -> HTMLResponse:
     with store.session() as conn:
         store.init_schema(conn)
         recent_checks = store.list_checks(conn, limit=6)
+        baseline = store.baseline_check(conn)
+        last_attempt = store.latest_any_check(conn)
     top = sorted(
         overview["conflicts"], key=lambda item: item["variant_count"], reverse=True
     )[:3]
@@ -115,6 +145,8 @@ def index(request: Request) -> HTMLResponse:
         "cycles": cycles,
         "seed_result": getattr(app.state, "seed_result", {"seeded": False, "reason": "启动中"}),
         "recent_checks": recent_checks,
+        "baseline": baseline,
+        "last_attempt": last_attempt,
         "error": None,
         "notice": None,
         "page": "index",
@@ -176,10 +208,25 @@ def workbench(request: Request) -> HTMLResponse:
 
 
 @app.get("/result/{check_id}", response_class=HTMLResponse)
-def result_page(request: Request, check_id: str) -> HTMLResponse:
+def result_page(request: Request, check_id: str, confirm: str | None = None, confirmed: str | None = None) -> HTMLResponse:
     with store.session() as conn:
+        store.init_schema(conn)
         payload = store.load_check(conn, check_id)
+        baseline = store.baseline_check(conn)
     metrics = load_metrics()
+    is_baseline = bool(payload and baseline and baseline["check_id"] == check_id)
+    error = None
+    notice = None
+    if payload is None:
+        error = f"体检记录 {check_id} 不存在，请回到首页重新体检"
+    elif payload.get("status") == store.CHECK_FAILED:
+        error = f"体检 {check_id} 执行失败：{payload.get('error') or '未知错误'}。旧基线结论仍可查看。"
+    elif payload.get("status") == store.CHECK_RUNNING:
+        notice = "这次体检尚未完成（正在执行或进程中断），暂不能确认为基线。"
+    if confirm == "failed":
+        error = "确认失败：只有完整成功的候选结论才能确认为基线。"
+    if confirmed == "1":
+        notice = "已确认为新基线，后续体检将以这份结论为对比基准。"
     context = {
         "app_name": settings.APP_NAME,
         "app_short": settings.APP_SHORT,
@@ -187,9 +234,11 @@ def result_page(request: Request, check_id: str) -> HTMLResponse:
         "metrics": metrics,
         "check": payload,
         "check_id": check_id,
+        "baseline": baseline,
+        "is_baseline": is_baseline,
         "missing": payload is None,
-        "error": None if payload else f"体检记录 {check_id} 不存在，请回到首页重新体检",
-        "notice": None,
+        "error": error,
+        "notice": notice if payload is not None else None,
         "page": "result",
         "active": "result",
     }
@@ -200,16 +249,21 @@ def result_page(request: Request, check_id: str) -> HTMLResponse:
 def review(request: Request) -> HTMLResponse:
     metrics = load_metrics()
     with store.session() as conn:
+        store.init_schema(conn)
         latest = store.latest_check(conn)
+        last_attempt = store.latest_any_check(conn)
+        baseline = store.baseline_check(conn)
         impact = store.latest_impact(conn)
         events = store.list_events(conn, limit=25)
-        checks = store.list_checks(conn, limit=8)
+        checks = store.list_checks(conn, limit=12, include_failed=True)
     context = {
         "app_name": settings.APP_NAME,
         "app_short": settings.APP_SHORT,
         "overview": report.overview(metrics),
         "metrics": metrics,
         "latest": latest,
+        "last_attempt": last_attempt,
+        "baseline": baseline,
         "impact": impact,
         "events": events,
         "checks": checks,
@@ -416,32 +470,166 @@ def api_parse(payload: ParseRequest = Body(default=ParseRequest())) -> JSONRespo
     )
 
 
-def _run_and_store_check() -> dict:
-    metrics = load_metrics()
-    payload = report.build_check(metrics)
+def _run_and_store_check(attempt_key: str | None = None) -> dict:
+    """执行一次体检并落库。
+
+    幂等：同一 attempt_key 的重试复用同一条记录（失败记录也会被复活，
+    而不是新开一条），因此重试既不会重复记录，也不会丢掉上次的失败记录。
+    """
+    key = (attempt_key or "").strip() or report.new_id("run")
     now = report.now_iso()
     with store.session() as conn:
         store.init_schema(conn)
-        store.save_check(conn, payload)
+        record = store.find_check_by_attempt(conn, key)
+        if record is not None and record["status"] in (
+            store.CHECK_CANDIDATE,
+            store.CHECK_CONFIRMED,
+        ):
+            return record  # 已成功的同一次尝试：直接返回原结论，不重复写入
+        baseline = store.baseline_check(conn)
+        if record is not None:
+            check_id = record["check_id"]
+            store.restart_check(conn, check_id, now)
+        else:
+            check_id = report.new_id("chk")
+            try:
+                store.start_check(conn, check_id, key, now)
+            except sqlite3.IntegrityError:
+                # 并发下同 attempt_key 已被另一请求写入：复用那条记录，避免重复
+                conn.rollback()
+                record = store.find_check_by_attempt(conn, key)
+                if record is None:
+                    raise
+                check_id = record["check_id"]
+                store.restart_check(conn, check_id, now)
+        conn.commit()
+
+    try:
+        metrics = load_metrics()
+        payload = report.build_check(metrics, check_id=check_id, baseline=baseline, created_at=now)
+    except Exception as exc:  # noqa: BLE001 - 体检失败必须落库且不破坏旧结论
+        message = f"{type(exc).__name__}: {exc}"
+        with store.session() as conn:
+            store.init_schema(conn)
+            store.fail_check(conn, check_id, message, now)
+            store.add_event(
+                conn,
+                "check_failed",
+                f"体检 {check_id} 失败，已保留记录与旧结论：{message}",
+                {"check_id": check_id, "attempt_key": key},
+                now,
+            )
+        raise
+
+    with store.session() as conn:
+        store.init_schema(conn)
+        payload["status"] = store.CHECK_CANDIDATE
+        store.finish_check(conn, check_id, payload)
         store.add_event(
             conn,
             "check",
-            f"执行注册表体检：冲突 {payload['stats']['conflict_count']} 组 / 环 {payload['stats']['cycle_count']} 条 / 发布阻断 {payload['stats']['publish_blocked_count']} 个",
-            {"check_id": payload["check_id"], "verdict": payload["verdict"]},
+            _check_event_summary(payload),
+            {
+                "check_id": payload["check_id"],
+                "verdict": payload["verdict"],
+                "attempt_key": key,
+                "baseline_check_id": payload["baseline"]["check_id"],
+                "delta": payload["delta_stats"],
+            },
             now,
         )
     return payload
 
 
+def _check_event_summary(payload: dict) -> str:
+    base = (
+        f"执行注册表体检：冲突 {payload['stats']['conflict_count']} 组 / "
+        f"环 {payload['stats']['cycle_count']} 条 / "
+        f"发布阻断 {payload['stats']['publish_blocked_count']} 个"
+    )
+    delta = payload.get("delta_stats") or {}
+    if payload.get("baseline", {}).get("check_id"):
+        base += (
+            f"；相对基线新增 {delta.get('new_count', 0)} / "
+            f"持续 {delta.get('persistent_count', 0)} / "
+            f"消失 {delta.get('resolved_count', 0)}"
+        )
+    else:
+        base += "；首次体检（暂无已确认基线）"
+    return base
+
+
 @app.post("/api/check")
-def api_check() -> dict:
-    return _run_and_store_check()
+def api_check(payload: CheckRequest = Body(default=CheckRequest())) -> dict:
+    return _run_and_store_check(payload.attempt_key)
 
 
 @app.post("/check")
-def check_form() -> RedirectResponse:
-    payload = _run_and_store_check()
+def check_form(attempt_key: str = Form("")) -> RedirectResponse:
+    payload = _run_and_store_check(attempt_key)
     return RedirectResponse(url=f"/result/{payload['check_id']}", status_code=303)
+
+
+@app.post("/api/check/{check_id}/confirm")
+def api_confirm_check(check_id: str) -> dict:
+    """确认候选体检为基线；未确认前不会自动切换基线。"""
+    now = report.now_iso()
+    with store.session() as conn:
+        store.init_schema(conn)
+        existing = store.load_check(conn, check_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail=f"体检记录 {check_id} 不存在")
+        try:
+            confirmed = store.confirm_check(conn, check_id, now)
+        except store.CheckStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        previous = existing.get("baseline") or {}
+        if previous.get("check_id") and previous["check_id"] != check_id:
+            store.add_event(
+                conn,
+                "baseline",
+                f"基线切换：{previous['check_id']} → {check_id}（{confirmed.get('verdict')}）",
+                {"from": previous["check_id"], "to": check_id},
+                now,
+            )
+        else:
+            store.add_event(
+                conn,
+                "baseline",
+                f"确认基线：{check_id}（后续体检以此为对比基准）",
+                {"to": check_id},
+                now,
+            )
+    return confirmed
+
+
+@app.post("/check/{check_id}/confirm")
+def confirm_check_form(check_id: str) -> RedirectResponse:
+    try:
+        api_confirm_check(check_id)
+    except HTTPException:
+        return RedirectResponse(url=f"/result/{check_id}?confirm=failed", status_code=303)
+    return RedirectResponse(url=f"/result/{check_id}?confirmed=1", status_code=303)
+
+
+@app.get("/api/baseline")
+def api_baseline() -> dict:
+    with store.session() as conn:
+        store.init_schema(conn)
+        baseline = store.baseline_check(conn)
+    if baseline is None:
+        return {"has_baseline": False, "baseline": None}
+    return {
+        "has_baseline": True,
+        "baseline": {
+            "check_id": baseline["check_id"],
+            "created_at": baseline["created_at"],
+            "confirmed_at": baseline["confirmed_at"],
+            "verdict": baseline.get("verdict"),
+            "fingerprint": baseline.get("fingerprint"),
+            "stats": baseline.get("stats", {}),
+        },
+    }
 
 
 @app.get("/api/check/{check_id}")

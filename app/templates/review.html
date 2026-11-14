@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}复核与发布 · {{ app_name }}{% endblock %}
 {% block crumb %}复核与发布{% endblock %}
-{% block meta %}<span class="dot {% if latest and latest.verdict == 'blocked' %}warn{% else %}ok{% endif %}"></span>{% if latest %}最近体检 {{ latest.check_id }} · {% if latest.verdict == 'blocked' %}不可发布{% else %}通过{% endif %}{% else %}还没有体检记录{% endif %} · 事件 {{ events | length }} 条{% endblock %}
+{% block meta %}<span class="dot {% if baseline %}ok{% elif latest %}warn{% else %}warn{% endif %}"></span>{% if baseline %}基线 {{ baseline.check_id }}{% elif latest %}最近候选 {{ latest.check_id }}{% else %}还没有体检记录{% endif %} · 事件 {{ events | length }} 条{% endblock %}
 {% block actions %}
 <a class="btn secondary small" href="/workbench">回工作台</a>
 <form method="post" action="/check" style="display:inline-flex;margin:0">
@@ -220,14 +220,22 @@
       </div>
       <div class="table-wrap">
         <table class="dense">
-          <thead><tr><th>体检号</th><th>时间</th><th>结论</th><th>冲突 / 环 / 阻断</th></tr></thead>
+          <thead><tr><th>体检号</th><th>时间</th><th>状态</th><th>结论</th><th>冲突 / 环 / 阻断</th><th>新增 / 持续 / 消失</th></tr></thead>
           <tbody>
           {% for item in checks %}
             <tr>
               <td><a class="mono" href="/result/{{ item.check_id }}">{{ item.check_id }}</a></td>
               <td class="small muted">{{ item.created_at }}</td>
-              <td>{% if item.verdict == 'blocked' %}<span class="tag err">不可发布</span>{% else %}<span class="tag ok">通过</span>{% endif %}</td>
+              <td>
+                {% if item.status == 'failed' %}<span class="tag err">失败</span>
+                {% elif item.status == 'confirmed' %}<span class="tag ok">基线</span>
+                {% else %}<span class="tag warn">候选</span>{% endif %}
+              </td>
+              <td>{% if item.status == 'failed' %}<span class="small muted">{{ item.error[:40] }}</span>{% elif item.verdict == 'blocked' %}<span class="tag err">不可发布</span>{% else %}<span class="tag ok">通过</span>{% endif %}</td>
               <td class="small">{{ item.stats.conflict_count }} / {{ item.stats.cycle_count }} / {{ item.stats.publish_blocked_count }}</td>
+              <td class="small">
+                {% if item.status == 'failed' %}—{% else %}{{ item.comparison.new_count }} / {{ item.comparison.persistent_count }} / {{ item.comparison.resolved_count }}{% endif %}
+              </td>
             </tr>
           {% endfor %}
           </tbody>
@@ -244,18 +252,33 @@
     </div>
     <div class="panel-body">
       <div class="field">
-        <label>最近一次体检</label>
-        {% if latest %}
+        <label>已确认基线 / 最近候选</label>
+        {% if baseline %}
         <p class="small" style="margin:0">
-          <a class="mono" href="/result/{{ latest.check_id }}">{{ latest.check_id }}</a>
-          {% if latest.verdict == 'blocked' %}<span class="tag err">不可发布</span>{% else %}<span class="tag ok">通过</span>{% endif %}
+          基线 <a class="mono" href="/result/{{ baseline.check_id }}">{{ baseline.check_id }}</a>
+          <span class="tag">已确认</span>
         </p>
         <p class="small muted" style="margin:2px 0 0">
-          冲突 {{ latest.stats.conflict_count }} 组 · 环 {{ latest.stats.cycle_count }} 条 · 阻断 {{ latest.stats.publish_blocked_count }} 个 · {{ latest.created_at }}
+          冲突 {{ baseline.stats.conflict_count }} 组 · 环 {{ baseline.stats.cycle_count }} 条 · 阻断 {{ baseline.stats.publish_blocked_count }} 个 · {{ baseline.created_at }}
         </p>
-        <p class="small muted" style="margin:4px 0 0">{{ latest.verdict_detail }}</p>
         {% else %}
-        <p class="small muted" style="margin:0">还没有体检记录，先点底部「再体检一次」。</p>
+        <p class="small muted" style="margin:0">还没有已确认基线，下次体检会把全部问题列为新增。</p>
+        {% endif %}
+        {% if latest %}
+        <p class="small muted" style="margin:6px 0 0">
+          最近候选：<a class="mono" href="/result/{{ latest.check_id }}">{{ latest.check_id }}</a>
+          （{% if latest.status == 'confirmed' %}已确认为基线{% else %}待确认{% endif %}）·
+          新增 {{ latest.comparison.new_count }} / 持续 {{ latest.comparison.persistent_count }} / 消失 {{ latest.comparison.resolved_count }}
+          {% if latest.status == 'candidate' %} · <a href="/result/{{ latest.check_id }}">去确认</a>{% endif %}
+        </p>
+        {% else %}
+        <p class="small muted" style="margin:6px 0 0">还没有体检记录，先点底部「再体检一次」。</p>
+        {% endif %}
+        {% if last_attempt and last_attempt.status == 'failed' %}
+        <div class="alert alert-error" style="margin:8px 0 0" role="alert">
+          最近一次体检 <a class="mono" href="/result/{{ last_attempt.check_id }}">{{ last_attempt.check_id }}</a> 失败：{{ last_attempt.error }}
+          <div class="small">失败记录已保留，旧结论仍可用；可到结果页用同一记录重试。</div>
+        </div>
         {% endif %}
       </div>
 
